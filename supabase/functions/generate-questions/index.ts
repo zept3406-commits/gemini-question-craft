@@ -1,10 +1,9 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey, x-api-keys",
 };
 
 interface GenerationConfig {
@@ -21,7 +20,6 @@ interface GenerationConfig {
   generationMode: string;
 }
 
-// API Key rotation manager
 class ApiKeyManager {
   private keys: string[] = [];
   private currentIndex = 0;
@@ -37,7 +35,6 @@ class ApiKeyManager {
   }
 
   getNextKey(): string {
-    // Find next valid key
     const startIndex = this.currentIndex;
     let attempts = 0;
 
@@ -47,7 +44,6 @@ class ApiKeyManager {
       const lastError = this.lastErrorTime.get(key) || 0;
       const timeSinceLastError = Date.now() - lastError;
 
-      // Skip keys with 3+ errors unless 60 seconds passed
       if (errorCount < 3 || timeSinceLastError > 60000) {
         return key;
       }
@@ -56,7 +52,6 @@ class ApiKeyManager {
       attempts++;
     }
 
-    // If all keys are problematic, reset and return first
     this.errorCounts.clear();
     this.lastErrorTime.clear();
     this.currentIndex = 0;
@@ -116,7 +111,6 @@ async function calculateQuestionDistribution(
   const distribution: Map<string, number> = new Map();
   let allocated = 0;
 
-  // Calculate proportional distribution
   topicsWithWeightage.forEach((tw) => {
     const count = Math.floor(
       (totalQuestions * (tw.weightage_percent || 0)) / 100
@@ -125,7 +119,6 @@ async function calculateQuestionDistribution(
     allocated += count;
   });
 
-  // Distribute remaining questions
   const remaining = totalQuestions - allocated;
   if (remaining > 0 && topicsWithWeightage.length > 0) {
     const firstTopic = topicsWithWeightage[0].topic_id;
@@ -140,7 +133,6 @@ async function fetchExistingQuestions(
   topicId: string,
   config: GenerationConfig
 ) {
-  // Fetch PYQs
   let pyqQuery = supabase
     .from("questions_topic_wise")
     .select("*")
@@ -156,7 +148,6 @@ async function fetchExistingQuestions(
 
   const { data: pyqs } = await pyqQuery.limit(50);
 
-  // Fetch already generated questions
   let newQuery = supabase
     .from("new_questions")
     .select("*")
@@ -185,11 +176,9 @@ function buildPrompt(
   config: GenerationConfig,
   questionNumber: number
 ) {
-  // Sample diverse questions for variety
   const allQuestions = [...pyqs, ...existingNew];
   const sampledQuestions = [];
   
-  // Take questions at different intervals for diversity
   if (allQuestions.length > 0) {
     const interval = Math.max(1, Math.floor(allQuestions.length / 10));
     for (let i = 0; i < Math.min(10, allQuestions.length); i++) {
@@ -413,12 +402,17 @@ Return ONLY a valid JSON object with corrections:
   }
 }
 
-serve(async (req) => {
+Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return new Response(null, {
+      status: 200,
+      headers: corsHeaders,
+    });
   }
 
   try {
+    const { createClient } = await import("jsr:@supabase/supabase-js@2");
+
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
@@ -426,7 +420,6 @@ serve(async (req) => {
 
     const config: GenerationConfig = await req.json();
 
-    // Get API keys from localStorage (passed from client)
     const apiKeysStr = req.headers.get("x-api-keys");
     if (!apiKeysStr) {
       throw new Error("No API keys provided");
@@ -435,14 +428,12 @@ serve(async (req) => {
     const apiKeys = JSON.parse(apiKeysStr);
     const apiKeyManager = new ApiKeyManager(apiKeys);
 
-    // Fetch topics with weightage
     const topicsWithWeightage = await fetchTopicsWithWeightage(
       supabase,
       config.partId,
       config.slotId
     );
 
-    // Calculate question distribution
     const distribution = await calculateQuestionDistribution(
       topicsWithWeightage,
       config.numQuestions
@@ -451,7 +442,6 @@ serve(async (req) => {
     const generatedQuestions: any[] = [];
     let totalGenerated = 0;
 
-    // Generate questions for each topic
     for (const [topicId, count] of distribution.entries()) {
       if (count === 0) continue;
 
@@ -460,14 +450,12 @@ serve(async (req) => {
 
       const topic = topicData.topics;
 
-      // Fetch existing questions for context
       const { pyqs, existingNew } = await fetchExistingQuestions(
         supabase,
         topicId,
         config
       );
 
-      // Generate questions for this topic
       for (let i = 0; i < count; i++) {
         let attempts = 0;
         const maxAttempts = 3;
@@ -482,7 +470,6 @@ serve(async (req) => {
               prompt
             );
 
-            // Verify answer matches options and solution uses topic notes
             console.log("Verifying question quality...");
             const verifiedQuestion = await verifyQuestionAnswer(
               apiKeyManager,
@@ -497,7 +484,6 @@ serve(async (req) => {
               continue;
             }
 
-            // Save to database
             const { data: savedQuestion, error: saveError } = await supabase
               .from("new_questions")
               .insert({
@@ -530,9 +516,9 @@ serve(async (req) => {
             
             console.log(`Successfully generated and saved question ${totalGenerated + 1}`);
             generatedQuestions.push(savedQuestion);
-            existingNew.push(savedQuestion); // Add to context for variety
+            existingNew.push(savedQuestion);
             totalGenerated++;
-            break; // Success, exit retry loop
+            break;
 
           } catch (error) {
             console.error(`Attempt ${attempts + 1} failed for question ${i + 1}:`, error);
@@ -547,7 +533,6 @@ serve(async (req) => {
           console.error(`Failed to generate question after ${maxAttempts} attempts for topic ${topic.name}`);
         }
 
-        // Delay between questions
         await sleep(1500);
       }
     }
