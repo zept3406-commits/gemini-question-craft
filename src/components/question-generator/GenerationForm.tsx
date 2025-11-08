@@ -123,6 +123,13 @@ const GenerationForm = ({
     setIsGenerating(true);
     
     try {
+      console.log("Starting question generation...");
+      
+      const apiKeys = localStorage.getItem("gemini_api_keys");
+      if (!apiKeys || JSON.parse(apiKeys).length === 0) {
+        throw new Error("No API keys configured");
+      }
+
       const { data, error } = await supabase.functions.invoke("generate-questions", {
         body: {
           courseId: selectedCourse,
@@ -138,24 +145,32 @@ const GenerationForm = ({
           generationMode,
         },
         headers: {
-          "x-api-keys": JSON.stringify(
-            JSON.parse(localStorage.getItem("gemini_api_keys") || "[]")
-          ),
+          "x-api-keys": JSON.stringify(JSON.parse(apiKeys)),
         },
       });
 
-      if (error) throw error;
+      if (error) {
+        console.error("Edge function error:", error);
+        throw error;
+      }
+
+      if (!data) {
+        throw new Error("No data returned from edge function");
+      }
+
+      console.log("Generation completed:", data);
 
       toast({
-        title: "Generation Started",
-        description: `Generating ${numQuestions} questions...`,
+        title: "Success!",
+        description: `Generated ${data.totalGenerated || 0} questions successfully`,
       });
 
       onQuestionsGenerated(data.questions || []);
     } catch (error: any) {
+      console.error("Generation failed:", error);
       toast({
         title: "Generation Failed",
-        description: error.message,
+        description: error.message || "Failed to generate questions. Check console for details.",
         variant: "destructive",
       });
     } finally {
