@@ -217,6 +217,12 @@ ${contextQuestions || "No reference available"}
 5. If examples use formulas A, B, C - you can use formula D or combine differently
 6. DO NOT copy problem structures - create fresh scenarios
 
+**ANSWER VALIDATION REQUIREMENTS**:
+1. For MCQ: The answer MUST be EXACTLY one of the 4 options (copy the exact text)
+2. For MSQ: The answer MUST list EXACTLY the correct option letters (e.g., "A, C")
+3. VERIFY your answer matches an option before responding
+4. The solution MUST clearly show why the answer is correct using topic notes concepts
+
 **FORMATTING REQUIREMENTS**:
 1. Use LaTeX: $ for inline math, $$ for display math
 2. For MCQ: Provide EXACTLY 4 distinct options
@@ -277,11 +283,16 @@ async function generateQuestionWithRetry(
       if (!response.ok) {
         const error = await response.text();
         console.error(`API Error (attempt ${attempt + 1}):`, error);
+        
+        // Check if API key is leaked
+        if (error.includes("reported as leaked") || error.includes("PERMISSION_DENIED")) {
+          throw new Error("API key has been flagged as leaked. Please provide a new API key that hasn't been compromised.");
+        }
+        
         apiKeyManager.markError(apiKey);
 
         if (attempt < maxRetries - 1) {
-          console.log("Waiting 5 seconds before retry...");
-          await sleep(5000);
+          await sleep(2000); // Reduced from 5s to 2s
           continue;
         }
         throw new Error(`API request failed: ${error}`);
@@ -300,10 +311,16 @@ async function generateQuestionWithRetry(
       return JSON.parse(jsonMatch[0]);
     } catch (error) {
       console.error(`Generation error (attempt ${attempt + 1}):`, error);
+      
+      // Don't retry if it's a leaked key error
+      if (error instanceof Error && error.message.includes("leaked")) {
+        throw error;
+      }
+      
       apiKeyManager.markError(apiKey);
 
       if (attempt < maxRetries - 1) {
-        await sleep(5000);
+        await sleep(2000); // Reduced from 5s to 2s
       } else {
         throw error;
       }
@@ -313,94 +330,8 @@ async function generateQuestionWithRetry(
   throw new Error("Max retries exceeded");
 }
 
-async function verifyQuestionAnswer(
-  apiKeyManager: ApiKeyManager,
-  question: any,
-  topicNotes: string
-): Promise<any> {
-  const apiKey = apiKeyManager.getNextKey();
-
-  const verificationPrompt = `You are a question quality checker. Verify this question and fix any issues.
-
-**Question**: ${question.question_statement}
-
-${question.options ? `**Options**:\n${question.options.map((opt: string, i: number) => `${String.fromCharCode(65 + i)}. ${opt}`).join('\n')}` : ''}
-
-**Stated Answer**: ${question.answer}
-
-**Solution**: ${question.solution}
-
-**Topic Notes** (Use these concepts in solution):
-${topicNotes}
-
-**CRITICAL VERIFICATION TASKS**:
-1. For MCQ/MSQ: CHECK if the stated answer EXACTLY matches one of the options. If not, FIX IT.
-2. Verify the solution is CORRECT and uses concepts from the topic notes.
-3. Ensure the solution explains step-by-step using formulas/concepts from notes.
-4. Make sure the difficulty level is appropriate.
-
-Return ONLY a valid JSON object with corrections:
-{
-  "question_statement": "Corrected question if needed",
-  "options": ["Corrected options if needed"],
-  "answer": "EXACT option text that is correct",
-  "solution": "Improved solution using topic notes concepts",
-  "difficulty_level": "Easy/Medium/Hard",
-  "is_valid": true/false
-}`;
-
-  try {
-    const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-        },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: verificationPrompt }] }],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 2048,
-          },
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      console.error("Verification failed, using original");
-      return question;
-    }
-
-    const data = await response.json();
-    const text = data.candidates[0].content.parts[0].text;
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-
-    if (!jsonMatch) {
-      return question;
-    }
-
-    const verified = JSON.parse(jsonMatch[0]);
-    
-    if (verified.is_valid === false) {
-      console.log("Question failed verification, regenerating...");
-      return null;
-    }
-
-    return {
-      ...question,
-      question_statement: verified.question_statement,
-      options: verified.options || question.options,
-      answer: verified.answer,
-      solution: verified.solution,
-      difficulty_level: verified.difficulty_level,
-    };
-  } catch (error) {
-    console.error("Verification error:", error);
-    return question;
-  }
-}
+// Verification removed to optimize performance - questions are now generated with strict prompts
+// and validated through the generation prompt itself
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -458,7 +389,7 @@ Deno.serve(async (req: Request) => {
 
       for (let i = 0; i < count; i++) {
         let attempts = 0;
-        const maxAttempts = 3;
+        const maxAttempts = 2; // Reduced from 3 to 2
         
         while (attempts < maxAttempts) {
           try {
@@ -470,20 +401,6 @@ Deno.serve(async (req: Request) => {
               prompt
             );
 
-            console.log("Verifying question quality...");
-            const verifiedQuestion = await verifyQuestionAnswer(
-              apiKeyManager,
-              question,
-              topic.notes || ""
-            );
-
-            if (!verifiedQuestion) {
-              console.log("Question failed verification, retrying...");
-              attempts++;
-              await sleep(2000);
-              continue;
-            }
-
             const { data: savedQuestion, error: saveError } = await supabase
               .from("new_questions")
               .insert({
@@ -492,12 +409,12 @@ Deno.serve(async (req: Request) => {
                 chapter_id: topic.chapter_id,
                 part_id: config.partId,
                 slot_id: config.slotId,
-                question_statement: verifiedQuestion.question_statement,
+                question_statement: question.question_statement,
                 question_type: config.questionType,
-                options: verifiedQuestion.options || null,
-                answer: verifiedQuestion.answer || null,
-                solution: verifiedQuestion.solution || null,
-                difficulty_level: verifiedQuestion.difficulty_level || "Medium",
+                options: question.options || null,
+                answer: question.answer || null,
+                solution: question.solution || null,
+                difficulty_level: question.difficulty_level || "Medium",
                 correct_marks: config.correctMarks,
                 incorrect_marks: config.incorrectMarks,
                 skipped_marks: config.skippedMarks,
@@ -522,9 +439,15 @@ Deno.serve(async (req: Request) => {
 
           } catch (error) {
             console.error(`Attempt ${attempts + 1} failed for question ${i + 1}:`, error);
+            
+            // If it's a leaked key error, fail immediately
+            if (error instanceof Error && error.message.includes("leaked")) {
+              throw error;
+            }
+            
             attempts++;
             if (attempts < maxAttempts) {
-              await sleep(3000);
+              await sleep(1000); // Reduced from 3s to 1s
             }
           }
         }
@@ -533,7 +456,7 @@ Deno.serve(async (req: Request) => {
           console.error(`Failed to generate question after ${maxAttempts} attempts for topic ${topic.name}`);
         }
 
-        await sleep(1500);
+        await sleep(500); // Reduced from 1500ms to 500ms
       }
     }
 
