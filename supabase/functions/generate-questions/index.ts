@@ -1,5 +1,4 @@
-// Edge runtime types import removed - causes build type checking issues
-// but doesn't affect runtime functionality
+// @ts-nocheck
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -181,9 +180,11 @@ function buildPrompt(
   const sampledQuestions = [];
   
   if (allQuestions.length > 0) {
-    const interval = Math.max(1, Math.floor(allQuestions.length / 10));
-    for (let i = 0; i < Math.min(10, allQuestions.length); i++) {
-      const idx = (i * interval) % allQuestions.length;
+    const take = Math.min(8, allQuestions.length);
+    const start = Math.floor(Math.random() * Math.max(1, allQuestions.length - take));
+    const interval = Math.max(1, Math.floor(allQuestions.length / take));
+    for (let i = 0; i < take; i++) {
+      const idx = (start + i * interval) % allQuestions.length;
       sampledQuestions.push(allQuestions[idx]);
     }
   }
@@ -274,8 +275,8 @@ async function generateQuestionWithRetry(
               },
             ],
             generationConfig: {
-              temperature: 0.9,
-              maxOutputTokens: 2048,
+              temperature: 0.8,
+              maxOutputTokens: 1024,
             },
           }),
         }
@@ -331,8 +332,86 @@ async function generateQuestionWithRetry(
   throw new Error("Max retries exceeded");
 }
 
-// Verification removed to optimize performance - questions are now generated with strict prompts
-// and validated through the generation prompt itself
+async function verifyQuestionAnswer(
+  apiKeyManager: ApiKeyManager,
+  question: any,
+  topicNotes: string,
+  questionType: string
+): Promise<any> {
+  const apiKey = apiKeyManager.getNextKey();
+
+  const verificationPrompt = `You are a question quality checker. Verify and FIX issues only if needed.
+
+**Question**: ${question.question_statement}
+
+${question.options ? `**Options**:\n${question.options.map((opt: string, i: number) => `${String.fromCharCode(65 + i)}. ${opt}`).join('\n')}` : ''}
+
+**Stated Answer**: ${question.answer}
+
+**Solution**: ${question.solution}
+
+**Topic Notes** (MUST use these concepts in the solution):
+${topicNotes}
+
+Rules:
+- For MCQ: The answer MUST be EXACTLY one of the 4 options (copy the exact option text)
+- For MSQ: Answer MUST be letters of all correct options (e.g., "A, C")
+- Ensure solution uses the Topic Notes concepts and is step-by-step
+- If everything is correct, return the original as-is
+
+Return ONLY valid JSON:
+{
+  "question_statement": "(same or corrected)",
+  "options": ["(same or corrected options)"],
+  "answer": "(correct format as per rules)",
+  "solution": "(same or improved solution using notes)",
+  "difficulty_level": "Easy|Medium|Hard"
+}`;
+
+  try {
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: verificationPrompt }] }],
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 512,
+          },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      console.error("Verification failed, using original");
+      return question;
+    }
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return question;
+
+    const verified = JSON.parse(jsonMatch[0]);
+    return {
+      ...question,
+      question_statement: verified.question_statement || question.question_statement,
+      options: verified.options || question.options,
+      answer: verified.answer || question.answer,
+      solution: verified.solution || question.solution,
+      difficulty_level: verified.difficulty_level || question.difficulty_level || "Medium",
+    };
+  } catch (e) {
+    console.error("Verification error:", e);
+    return question;
+  }
+}
+
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -343,7 +422,7 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { createClient } = await import("jsr:@supabase/supabase-js@2");
+    const { createClient } = await import("https://esm.sh/@supabase/supabase-js@2");
 
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
@@ -352,13 +431,18 @@ Deno.serve(async (req: Request) => {
 
     const config: GenerationConfig = await req.json();
 
-    const apiKeysStr = req.headers.get("x-api-keys");
-    if (!apiKeysStr) {
-      throw new Error("No API keys provided");
+    const secretKey = Deno.env.get("GEMINI_API_KEY") || "";
+    let headerKeys: string[] = [];
+    const headerRaw = req.headers.get("x-api-keys");
+    if (headerRaw) {
+      try { headerKeys = JSON.parse(headerRaw); } catch {}
+    }
+    const allKeys = [secretKey, ...headerKeys].filter(Boolean);
+    if (allKeys.length === 0) {
+      throw new Error("No API keys configured. Set GEMINI_API_KEY secret or pass x-api-keys header (JSON array).");
     }
 
-    const apiKeys = JSON.parse(apiKeysStr);
-    const apiKeyManager = new ApiKeyManager(apiKeys);
+    const apiKeyManager = new ApiKeyManager(allKeys);
 
     const topicsWithWeightage = await fetchTopicsWithWeightage(
       supabase,
@@ -402,6 +486,34 @@ Deno.serve(async (req: Request) => {
               prompt
             );
 
+            // Conditional verification to ensure answer-options consistency and solution quality
+            let finalQuestion = question;
+            const qType = (config.questionType || "").toUpperCase();
+            const hasOptions = Array.isArray(question.options) && question.options.length >= 4;
+
+            const isMCQ = qType.includes("MCQ");
+            const isMSQ = qType.includes("MSQ");
+
+            const answerMismatch = (() => {
+              if (!hasOptions || !question.answer) return true;
+              if (isMCQ) {
+                return !question.options.some((opt: string) => (question.answer || "").trim() === (opt || "").trim());
+              }
+              if (isMSQ) {
+                // Expect letters like "A, C" referencing existing options
+                const letters = String(question.answer).split(/[,\s]+/).filter(Boolean);
+                return letters.some((l: string) => {
+                  const idx = l.trim().toUpperCase().charCodeAt(0) - 65;
+                  return idx < 0 || idx >= question.options.length;
+                });
+              }
+              return false;
+            })();
+
+            if ((isMCQ || isMSQ) && (answerMismatch || !question.solution || String(question.solution).length < 60)) {
+              finalQuestion = await verifyQuestionAnswer(apiKeyManager, question, topic.notes || "", config.questionType);
+            }
+
             const { data: savedQuestion, error: saveError } = await supabase
               .from("new_questions")
               .insert({
@@ -410,12 +522,12 @@ Deno.serve(async (req: Request) => {
                 chapter_id: topic.chapter_id,
                 part_id: config.partId,
                 slot_id: config.slotId,
-                question_statement: question.question_statement,
+                question_statement: finalQuestion.question_statement,
                 question_type: config.questionType,
-                options: question.options || null,
-                answer: question.answer || null,
-                solution: question.solution || null,
-                difficulty_level: question.difficulty_level || "Medium",
+                options: finalQuestion.options || null,
+                answer: finalQuestion.answer || null,
+                solution: finalQuestion.solution || null,
+                difficulty_level: finalQuestion.difficulty_level || "Medium",
                 correct_marks: config.correctMarks,
                 incorrect_marks: config.incorrectMarks,
                 skipped_marks: config.skippedMarks,
