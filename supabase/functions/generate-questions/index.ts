@@ -256,10 +256,45 @@ async function generateQuestionWithRetry(
   prompt: string,
   maxRetries = 3
 ): Promise<any> {
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const apiKey = apiKeyManager.getNextKey();
+  const gatewayKey = Deno.env.get("LOVABLE_API_KEY") || "";
 
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
+      // Prefer Lovable AI Gateway if available (no user keys needed)
+      if (gatewayKey) {
+        const resp = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${gatewayKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "google/gemini-2.5-pro",
+            messages: [
+              { role: "system", content: "You are an expert exam question generator. Return ONLY valid JSON as specified in the user instructions." },
+              { role: "user", content: prompt },
+            ],
+            max_tokens: 800,
+          }),
+        });
+
+        if (resp.ok) {
+          const data = await resp.json();
+          const textOut: string = data.choices?.[0]?.message?.content ?? "";
+          const jsonMatch = textOut.match(/\{[\s\S]*\}/);
+          if (!jsonMatch) throw new Error("No valid JSON found in AI response");
+          return JSON.parse(jsonMatch[0]);
+        }
+
+        if (resp.status === 429) throw new Error("Rate limited by AI gateway. Please try again shortly.");
+        if (resp.status === 402) throw new Error("AI gateway credits exceeded. Please top up.");
+        const t = await resp.text();
+        console.error("AI gateway error:", resp.status, t);
+        // fall through to direct Gemini call
+      }
+
+      // Fallback: direct Gemini call using rotating keys
+      const apiKey = apiKeyManager.getNextKey();
       const response = await fetch(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
         {
@@ -270,9 +305,7 @@ async function generateQuestionWithRetry(
           },
           body: JSON.stringify({
             contents: [
-              {
-                parts: [{ text: prompt }],
-              },
+              { parts: [{ text: prompt }] },
             ],
             generationConfig: {
               temperature: 0.8,
@@ -285,16 +318,12 @@ async function generateQuestionWithRetry(
       if (!response.ok) {
         const error = await response.text();
         console.error(`API Error (attempt ${attempt + 1}):`, error);
-        
-        // Check if API key is leaked
         if (error.includes("reported as leaked") || error.includes("PERMISSION_DENIED")) {
           throw new Error("API key has been flagged as leaked. Please provide a new API key that hasn't been compromised.");
         }
-        
         apiKeyManager.markError(apiKey);
-
         if (attempt < maxRetries - 1) {
-          await sleep(2000); // Reduced from 5s to 2s
+          await sleep(1500);
           continue;
         }
         throw new Error(`API request failed: ${error}`);
@@ -302,30 +331,17 @@ async function generateQuestionWithRetry(
 
       const data = await response.json();
       apiKeyManager.markSuccess(apiKey);
-
       const text = data.candidates[0].content.parts[0].text;
       const jsonMatch = text.match(/\{[\s\S]*\}/);
-
-      if (!jsonMatch) {
-        throw new Error("No valid JSON found in response");
-      }
-
+      if (!jsonMatch) throw new Error("No valid JSON found in response");
       return JSON.parse(jsonMatch[0]);
     } catch (error) {
       console.error(`Generation error (attempt ${attempt + 1}):`, error);
-      
-      // Don't retry if it's a leaked key error
-      if (error instanceof Error && error.message.includes("leaked")) {
-        throw error;
-      }
-      
-      apiKeyManager.markError(apiKey);
-
       if (attempt < maxRetries - 1) {
-        await sleep(2000); // Reduced from 5s to 2s
-      } else {
-        throw error;
+        await sleep(1500);
+        continue;
       }
+      throw error;
     }
   }
 
