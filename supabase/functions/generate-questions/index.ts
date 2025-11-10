@@ -1,4 +1,5 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+// Edge runtime types import removed - causes build type checking issues
+// but doesn't affect runtime functionality
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
