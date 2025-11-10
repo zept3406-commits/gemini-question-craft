@@ -33,6 +33,8 @@ const GenerationForm = ({
   const [selectedSlot, setSelectedSlot] = useState("");
   const [selectedPart, setSelectedPart] = useState("");
   const [generationMode, setGenerationMode] = useState("new");
+
+  const [questionDistribution, setQuestionDistribution] = useState<Map<string, { topicName: string; count: number }>>(new Map());
   
   const [questionType, setQuestionType] = useState("MCQ (Single Correct)");
   const [numQuestions, setNumQuestions] = useState("30");
@@ -87,19 +89,77 @@ const GenerationForm = ({
     if (selectedCourse) {
       const fetchParts = async () => {
         let query = supabase.from("parts").select("*").eq("course_id", selectedCourse);
-        
+
         if (selectedSlot) {
           query = query.eq("slot_id", selectedSlot);
         } else {
           query = query.is("slot_id", null);
         }
-        
+
         const { data } = await query;
         if (data) setParts(data);
       };
       fetchParts();
     }
   }, [selectedCourse, selectedSlot]);
+
+  // Calculate question distribution when part/slot/numQuestions changes
+  useEffect(() => {
+    if (selectedPart && numQuestions) {
+      calculateDistribution();
+    }
+  }, [selectedPart, selectedSlot, numQuestions]);
+
+  const calculateDistribution = async () => {
+    if (!selectedPart) return;
+
+    let query = supabase
+      .from("topics_weightage")
+      .select(`
+        *,
+        topics:topic_id (
+          id,
+          name
+        )
+      `)
+      .eq("part_id", selectedPart);
+
+    if (selectedSlot) {
+      query = query.eq("slot_id", selectedSlot);
+    }
+
+    const { data: topicsWithWeightage } = await query;
+    if (!topicsWithWeightage) return;
+
+    const distribution = new Map<string, { topicName: string; count: number }>();
+    let allocated = 0;
+    const totalQ = parseInt(numQuestions);
+
+    topicsWithWeightage.forEach((tw: any) => {
+      const count = Math.floor((totalQ * (tw.weightage_percent || 0)) / 100);
+      if (tw.topics) {
+        distribution.set(tw.topic_id, {
+          topicName: tw.topics.name,
+          count,
+        });
+        allocated += count;
+      }
+    });
+
+    const remaining = totalQ - allocated;
+    if (remaining > 0 && topicsWithWeightage.length > 0 && topicsWithWeightage[0].topics) {
+      const firstTopicId = topicsWithWeightage[0].topic_id;
+      const existing = distribution.get(firstTopicId);
+      if (existing) {
+        distribution.set(firstTopicId, {
+          ...existing,
+          count: existing.count + remaining,
+        });
+      }
+    }
+
+    setQuestionDistribution(distribution);
+  };
 
   const handleGenerate = async () => {
     if (!apiKeysConfigured) {
@@ -360,6 +420,23 @@ const GenerationForm = ({
           </div>
         </div>
       </div>
+
+      {questionDistribution.size > 0 && (
+        <div className="space-y-2 border-t pt-4">
+          <h3 className="font-semibold text-sm">Question Distribution by Topic</h3>
+          <div className="max-h-48 overflow-y-auto space-y-1">
+            {Array.from(questionDistribution.entries()).map(([topicId, info]) => (
+              <div
+                key={topicId}
+                className="flex justify-between items-center text-xs p-2 bg-muted/50 rounded"
+              >
+                <span className="font-medium">{info.topicName}</span>
+                <span className="text-muted-foreground">{info.count} questions</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Generate Button */}
       <Button
